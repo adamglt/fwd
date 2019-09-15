@@ -1,0 +1,10 @@
+namespaces:
+- name: ns1
+  services:
+  - name: svc1
+  - name: svc2
+- name: ns2
+  services:
+  - name: svc3
+  - name: svc4-manual
+    ports: ["8080", "8081"]
