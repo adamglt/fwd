@@ -47,6 +47,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	fmt.Println("running global setup...")
+	if err := setup(targets); err != nil {
+		fmt.Printf("failed to setup local network: %v\n", err)
+		os.Exit(1)
+	}
+
 	hosts, err := txeh.NewHostsDefault()
 	if err != nil {
 		fmt.Printf("failed to init hosts: %v\n", err)
@@ -87,6 +93,12 @@ func main() {
 	fmt.Println("cleaning up hosts...")
 	if err := hosts.Save(); err != nil {
 		fmt.Printf("failed to update hosts file: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("running global cleanup...")
+	if err := cleanup(targets); err != nil {
+		fmt.Printf("failed to cleanup local network: %v\n", err)
 		os.Exit(1)
 	}
 }
