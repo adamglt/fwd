@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -31,11 +32,16 @@ type Service struct {
 	addr  string
 }
 
+var (
+	kubeContext = flag.String("context", "", "kubectl context to use")
+)
+
 func main() {
 	if os.Geteuid() != 0 {
 		fmt.Println("must run as root")
 		os.Exit(1)
 	}
+	flag.Parse()
 
 	targets, err := readConfig()
 	if err != nil {
@@ -153,7 +159,9 @@ func fill(targets []*Namespace) error {
 
 	cmd := exec.Command("kubectl", "get", "services",
 		"--all-namespaces",
-		"-o=go-template="+tmpl)
+		"-o=go-template="+tmpl,
+		"--context", *kubeContext,
+	)
 	out, err := cmd.Output()
 	if err != nil {
 		return err
@@ -214,6 +222,7 @@ func (f fwder) run() error {
 		fmt.Sprintf("svc/%s", f.svc.Name),
 		"--address", f.svc.addr,
 		"--namespace", f.svc.ns,
+		"--context", *kubeContext,
 	)
 	for _, port := range f.svc.Ports {
 		cmd.Args = append(cmd.Args, port)
