@@ -4,76 +4,73 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"flag"
+	"encoding/csv"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/txn2/txeh"
 	"golang.org/x/sync/errgroup"
-	"gopkg.in/yaml.v2"
 )
 
-type Namespace struct {
-	Name     string     `yaml:"name"`
-	Services []*Service `yaml:"services"`
-}
-
-type Service struct {
-	Name  string   `yaml:"name"`
-	Ports []string `yaml:"ports"`
-	ns    string
-	key   string
-	addr  string
-}
-
 var (
-	kubeContext = flag.String("context", "", "kubectl context to use")
+	log = &logrus.Logger{
+		Out:       os.Stdout,
+		Formatter: &logrus.TextFormatter{},
+		Hooks:     make(logrus.LevelHooks),
+		Level:     logrus.InfoLevel,
+	}
 )
 
 func main() {
 	if os.Geteuid() != 0 {
-		fmt.Println("must run as root")
+		fmt.Println("fwd must run as root")
 		os.Exit(1)
 	}
-	flag.Parse()
 
 	targets, err := readConfig()
 	if err != nil {
-		fmt.Printf("failed to read config file: %v\n", err)
-		os.Exit(1)
-	}
-	if err := fill(targets); err != nil {
-		fmt.Printf("failed to find services: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to read config file: %v", err)
 	}
 
-	fmt.Println("running global setup...")
+	log.Info("filling contexts...")
+	if err := fillContexts(targets); err != nil {
+		log.Fatalf("failed to fill contexts: %v", err)
+	}
+
+	log.Info("checking for conflicts...")
+	if err := markConflicts(targets); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Info("filling service ports...")
+	if err := fillPorts(targets); err != nil {
+		log.Fatalf("failed to fill ports: %v", err)
+	}
+
+	log.Info("running global setup...")
 	if err := setup(targets); err != nil {
-		fmt.Printf("failed to setup local network: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to setup local network: %v", err)
 	}
 
+	log.Info("writing hosts...")
 	hosts, err := txeh.NewHostsDefault()
 	if err != nil {
-		fmt.Printf("failed to init hosts: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to init hosts: %v", err)
 	}
-	for _, ns := range targets {
-		for _, svc := range ns.Services {
-			hosts.RemoveAddress(svc.addr)
-			hosts.AddHost(svc.addr, svc.key)
+	for _, t := range targets {
+		hosts.RemoveAddress(t.addr)
+		hosts.AddHost(t.addr, t.fqn())
+		if !t.conflict {
+			hosts.AddHost(t.addr, t.short())
 		}
 	}
-	fmt.Println("writing hosts...")
 	if err := hosts.Save(); err != nil {
-		fmt.Printf("failed to update hosts file: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to update hosts file: %v", err)
 	}
 
 	ctx := context.Background()
@@ -81,116 +78,145 @@ func main() {
 	go watchSig(cancel)
 
 	eg, ctx := errgroup.WithContext(ctx)
-	for _, ns := range targets {
-		for _, svc := range ns.Services {
-			f := fwder{ctx, *svc}
-			eg.Go(f.run)
+	for _, t := range targets {
+		f := fwder{
+			log: log.WithFields(logrus.Fields{
+				"ctx": t.context,
+				"svc": t.short(),
+			}),
+			ctx:    ctx,
+			target: t,
 		}
+		eg.Go(f.run)
 	}
 	if err := eg.Wait(); err != nil {
-		fmt.Printf("error caught: %v\n", err)
+		log.Warnf("error caught: %v", err)
 	}
 
-	for _, ns := range targets {
-		for _, svc := range ns.Services {
-			hosts.RemoveAddress(svc.addr)
-		}
+	log.Info("cleaning up hosts...")
+	for _, t := range targets {
+		hosts.RemoveAddress(t.addr)
 	}
-	fmt.Println("cleaning up hosts...")
 	if err := hosts.Save(); err != nil {
-		fmt.Printf("failed to update hosts file: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to update hosts file: %v", err)
 	}
 
-	fmt.Println("running global cleanup...")
+	log.Info("running global cleanup...")
 	if err := cleanup(targets); err != nil {
-		fmt.Printf("failed to cleanup local network: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to cleanup local network: %v", err)
 	}
 }
 
-func readConfig() ([]*Namespace, error) {
-	bb, err := ioutil.ReadFile("./.fwd.yaml")
-	if err != nil && os.IsNotExist(err) {
-		home, herr := os.UserHomeDir()
-		if herr != nil {
-			return nil, herr
-		}
-		bb, err = ioutil.ReadFile(home + "/.fwd.yaml")
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var cfg struct {
-		Namespaces []*Namespace `yaml:"namespaces"`
-	}
-	if err := yaml.Unmarshal(bb, &cfg); err != nil {
-		return nil, err
-	}
-	return cfg.Namespaces, nil
-}
-
-// output: <ns> <svc> <port...>
-const tmpl = `{{range .items}}` +
-	`{{.metadata.namespace}} {{.metadata.name}} ` +
-	`{{range .spec.ports}}{{if eq .protocol "TCP"}}{{print .port " "}}{{end}}{{end}}` +
-	`{{println}}{{end}}`
-
-func fill(targets []*Namespace) error {
-	autofill := make(map[string]*Service)
-	idx := 0
-	for _, ns := range targets {
-		for _, svc := range ns.Services {
-			idx++
-			svc.ns = ns.Name
-			svc.addr = fmt.Sprintf("127.0.11.%v", idx)
-			svc.key = fmt.Sprintf("%s.%s", svc.Name, ns.Name)
-			if len(svc.Ports) == 0 {
-				autofill[svc.key] = svc
-			}
-		}
-	}
-	if len(autofill) == 0 {
-		return nil
-	}
-
-	fmt.Println("filling service ports...")
-
-	cmd := exec.Command("kubectl", "get", "services",
-		"--all-namespaces",
-		"-o=go-template="+tmpl,
-		"--context", *kubeContext,
-	)
+func fillContexts(targets []*target) error {
+	// find current context
+	cmd := exec.Command("kubectl", "config", "current-context")
 	out, err := cmd.Output()
 	if err != nil {
 		return err
 	}
+	cur := string(out)
 
-	s := bufio.NewScanner(bytes.NewReader(out))
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		segments := strings.Split(line, " ")
-		if len(segments) < 3 {
-			continue
-		}
-		key := fmt.Sprintf("%s.%s", segments[1], segments[0])
-		if svc, ok := autofill[key]; ok {
-			for _, port := range segments[2:] {
-				svc.Ports = append(svc.Ports, port)
-			}
+	// fill missing entries
+	for _, t := range targets {
+		if t.context == "" {
+			t.context = cur
 		}
 	}
-	if err := s.Err(); err != nil {
+
+	return nil
+}
+
+func markConflicts(targets []*target) error {
+	shorts := make(map[string]*target, len(targets))
+	dups := make(map[string]bool)
+	for _, t := range targets {
+		short := t.short()
+		if other, ok := shorts[short]; ok {
+			t.conflict = true
+			other.conflict = true
+			if t.context == other.context {
+				dups[t.context] = true
+			}
+		} else {
+			shorts[short] = t
+		}
+	}
+	if len(dups) > 0 {
+		var col []string
+		for d := range dups {
+			col = append(col, d)
+		}
+		return fmt.Errorf("duplicate service entries: %s", strings.Join(col, ", "))
+	}
+	return nil
+}
+
+// output: <svc>.<ns>,<protocol>,<portName>,<portNumber>
+const tmpl = `{{range $i, $svc := .items}}{{range .spec.ports}}` +
+	`{{$svc.metadata.name}}.{{$svc.metadata.namespace}},{{.protocol}},{{.name}},{{.port}}` +
+	`{{println}}{{end}}{{end}}`
+
+func fillPorts(targets []*target) error {
+	var (
+		contexts  []string                                 // unique contexts
+		contextsM = make(map[string]bool)                  // dedup contexts
+		targetsM  = make(map[string]*target, len(targets)) // targets by fqn
+	)
+	for _, t := range targets {
+		if !contextsM[t.context] {
+			contextsM[t.context] = true
+			contexts = append(contexts, t.context)
+		}
+		targetsM[t.fqn()] = t
+	}
+
+	eg := errgroup.Group{}
+	for _, c := range contexts {
+		localC := c
+		eg.Go(func() error {
+			cmd := exec.Command("kubectl", "get", "services",
+				"--context", localC,
+				"--all-namespaces",
+				"-o=go-template="+tmpl,
+			)
+			out, err := cmd.Output()
+			if err != nil {
+				return fmt.Errorf("failed to run cmd: %w", err)
+			}
+			records, err := csv.NewReader(bytes.NewReader(out)).ReadAll()
+			if err != nil {
+				return fmt.Errorf("failed to parse csv: %w", err)
+			}
+			for _, record := range records {
+				var (
+					shortKey = record[0]
+					proto    = record[1]
+					name     = record[2]
+					number   = record[3]
+				)
+				if proto != "TCP" {
+					continue
+				}
+				if name == "<no value>" {
+					name = ""
+				}
+				longKey := fmt.Sprintf("%s.%s", shortKey, localC)
+				if t, ok := targetsM[longKey]; ok {
+					t.ports[name] = number
+				}
+			}
+
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
 		return err
 	}
 
 	var missing []string
-	for _, ns := range targets {
-		for _, svc := range ns.Services {
-			if len(svc.Ports) == 0 {
-				missing = append(missing, svc.key)
-			}
+	for _, t := range targets {
+		if len(t.ports) == 0 {
+			missing = append(missing, t.fqn())
 		}
 	}
 	if len(missing) > 0 {
@@ -209,38 +235,65 @@ func watchSig(cancel context.CancelFunc) {
 }
 
 type fwder struct {
-	ctx context.Context
-	svc Service
+	log    *logrus.Entry
+	ctx    context.Context
+	target *target
 }
 
 func (f fwder) run() error {
-	// let all go routines catch up
-	time.Sleep(100 * time.Millisecond)
-
-	// run port-forward
-	cmd := exec.Command("kubectl", "port-forward",
-		fmt.Sprintf("svc/%s", f.svc.Name),
-		"--address", f.svc.addr,
-		"--namespace", f.svc.ns,
-		"--context", *kubeContext,
-	)
-	for _, port := range f.svc.Ports {
-		cmd.Args = append(cmd.Args, port)
-	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	go func() {
-		<-f.ctx.Done()
-		if cmd != nil && cmd.Process != nil {
-			fmt.Printf("%s cleanup\n", f.svc.key)
-			_ = cmd.Process.Kill()
+	for {
+		cmd := exec.Command("kubectl", "port-forward",
+			fmt.Sprintf("svc/%s", f.target.service),
+			"--context", f.target.context,
+			"--address", f.target.addr,
+			"--namespace", f.target.namespace,
+		)
+		for name, number := range f.target.ports {
+			if f.target.conflict {
+				f.log.Infof("forwarding: %s:%s (%s)", f.target.fqn(), number, name)
+			} else {
+				f.log.Infof("forwarding: %s:%s (%s)", f.target.short(), number, name)
+			}
+			cmd.Args = append(cmd.Args, number)
 		}
-	}()
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("pipe failed: %v", err)
+		}
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("start failed: %v", err)
+		}
 
-	if err := cmd.Run(); err != nil {
-		cmd = nil
-		return err
+		orderCh := make(chan bool)
+		done := false
+		go func() {
+			kill := false
+			select {
+			case <-f.ctx.Done():
+				kill = true
+				done = true
+			case order := <-orderCh:
+				kill = order
+			}
+			if kill && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}()
+
+		s := bufio.NewScanner(stderr)
+		for s.Scan() {
+			f.log.Warn("error detected, reconnecting...")
+			orderCh <- true
+		}
+		if err := s.Err(); err != nil {
+			f.log.Warnf("scanner failed: %v", err)
+		}
+
+		_ = cmd.Wait()
+		if done {
+			break
+		}
 	}
+
 	return nil
 }

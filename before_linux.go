@@ -1,9 +1,9 @@
 package main
 
-func setup(targets []*Namespace) error {
+func setup(targets []*target) error {
 	return nil // nothing to do in linux
 }
 
-func cleanup(targets []*Namespace) error {
+func cleanup(targets []*target) error {
 	return nil // nothing to do in linux
 }
