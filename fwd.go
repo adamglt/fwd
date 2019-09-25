@@ -80,10 +80,6 @@ func main() {
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, t := range targets {
 		f := fwder{
-			log: log.WithFields(logrus.Fields{
-				"ctx": t.context,
-				"svc": t.short(),
-			}),
 			ctx:    ctx,
 			target: t,
 		}
@@ -198,7 +194,7 @@ func fillPorts(targets []*target) error {
 					continue
 				}
 				if name == "<no value>" {
-					name = ""
+					name = "unnamed"
 				}
 				longKey := fmt.Sprintf("%s.%s", shortKey, localC)
 				if t, ok := targetsM[longKey]; ok {
@@ -235,7 +231,6 @@ func watchSig(cancel context.CancelFunc) {
 }
 
 type fwder struct {
-	log    *logrus.Entry
 	ctx    context.Context
 	target *target
 }
@@ -249,10 +244,9 @@ func (f fwder) run() error {
 			"--namespace", f.target.namespace,
 		)
 		for name, number := range f.target.ports {
-			if f.target.conflict {
-				f.log.Infof("forwarding: %s:%s (%s)", f.target.fqn(), number, name)
-			} else {
-				f.log.Infof("forwarding: %s:%s (%s)", f.target.short(), number, name)
+			log.Infof("forwarding %s:%s (%s)", f.target.fqn(), number, name)
+			if !f.target.conflict {
+				log.Infof("forwarding %s:%s (%s)", f.target.short(), number, name)
 			}
 			cmd.Args = append(cmd.Args, number)
 		}
@@ -282,11 +276,11 @@ func (f fwder) run() error {
 
 		s := bufio.NewScanner(stderr)
 		for s.Scan() {
-			f.log.Warn("error detected, reconnecting...")
+			log.Warnf("error detected in %s, reconnecting...", f.target.fqn())
 			orderCh <- true
 		}
 		if err := s.Err(); err != nil {
-			f.log.Warnf("scanner failed: %v", err)
+			log.Warnf("scanner failed: %v", err)
 		}
 
 		_ = cmd.Wait()
