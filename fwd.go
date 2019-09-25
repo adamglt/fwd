@@ -258,7 +258,7 @@ func (f fwder) run() error {
 			return fmt.Errorf("start failed: %v", err)
 		}
 
-		orderCh := make(chan bool)
+		exit := make(chan struct{})
 		done := false
 		go func() {
 			kill := false
@@ -266,8 +266,8 @@ func (f fwder) run() error {
 			case <-f.ctx.Done():
 				kill = true
 				done = true
-			case order := <-orderCh:
-				kill = order
+			case <-exit:
+				kill = true
 			}
 			if kill && cmd.Process != nil {
 				_ = cmd.Process.Kill()
@@ -277,7 +277,7 @@ func (f fwder) run() error {
 		s := bufio.NewScanner(stderr)
 		for s.Scan() {
 			log.Warnf("error detected in %s, reconnecting...", f.target.fqn())
-			orderCh <- true
+			close(exit)
 		}
 		if err := s.Err(); err != nil {
 			log.Warnf("scanner failed: %v", err)
