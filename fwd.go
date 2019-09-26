@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -106,9 +107,9 @@ func main() {
 func fillContexts(targets []*target) error {
 	// find current context
 	cmd := exec.Command("kubectl", "config", "current-context")
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
+		return errors.New(string(out))
 	}
 	cur := string(out)
 
