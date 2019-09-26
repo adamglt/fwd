@@ -67,7 +67,6 @@ func readConfig() ([]*target, error) {
 		return nil, err
 	}
 	var targets []*target
-	keys := make(map[string]*target)
 	for _, c := range cfg.Contexts {
 		for _, ns := range c.Namespaces {
 			for _, svc := range ns.Services {
@@ -75,18 +74,13 @@ func readConfig() ([]*target, error) {
 				if err != nil {
 					return nil, err
 				}
-				t := &target{
+				targets = append(targets, &target{
 					context:   c.Name,
 					namespace: ns.Name,
 					service:   svc.Name,
 					addr:      addr,
 					ports:     map[string]string{},
-				}
-				if other, ok := keys[t.short()]; ok {
-					t.conflict = true
-					other.conflict = true
-				}
-				targets = append(targets, t)
+				})
 			}
 		}
 	}
