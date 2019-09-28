@@ -1,9 +1,9 @@
 package main
 
-func setup(targets []*target) error {
+func prepareIPs(_ []string) error {
 	return nil // nothing to do in linux
 }
 
-func cleanup(targets []*target) error {
+func cleanupIPs(_ []string) error {
 	return nil // nothing to do in linux
 }

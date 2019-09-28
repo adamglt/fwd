@@ -11,13 +11,22 @@ import (
 )
 
 const (
-	configName = ".fwd.yaml"
+	// file name fwd looks for
+	configFile = ".fwd.yaml"
+
+	// default local cidr
+	defaultCIDR = "127.0.11.0/24"
 )
 
+// config yaml structure
 type config struct {
-	CIDR     string `yaml:"cidr"`
+	// local cidr to use for aliased ips
+	// defaults to defaultCIDR
+	CIDR string `yaml:"cidr"`
+
+	// context->namespace->service tree
 	Contexts []struct {
-		Name       string `yaml:"name"`
+		Name       string `yaml:"name"` // defaults to current-context
 		Namespaces []struct {
 			Name     string `yaml:"name"`
 			Services []struct {
@@ -27,94 +36,100 @@ type config struct {
 	} `yaml:"contexts"`
 }
 
-type target struct {
-	context   string
-	namespace string
-	service   string
-	addr      string
-	ports     map[string]string
-	conflict  bool
-}
-
-func (t target) short() string {
-	return fmt.Sprintf("%s.%s", t.service, t.namespace)
-}
-
-func (t target) fqn() string {
-	return fmt.Sprintf("%s.%s.%s", t.service, t.namespace, t.context)
-}
-
-func readConfig() ([]*target, error) {
-	raw, err := ioutil.ReadFile(configName)
+// reads the config file and flattens the tree structure.
+// local directory is tried first, then the user's home directory.
+func readConfig() (string, []*target, error) {
+	// try local dir
+	raw, err := ioutil.ReadFile(configFile)
 	if err != nil && os.IsNotExist(err) {
 		home, homeErr := os.UserHomeDir()
 		if homeErr != nil {
-			return nil, homeErr
+			return "", nil, homeErr
 		}
-		raw, err = ioutil.ReadFile(filepath.Join(home, configName))
+		// try home dir
+		raw, err = ioutil.ReadFile(filepath.Join(home, configFile))
 	}
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
+	// unmarshal cfg
 	var cfg config
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	alloc, err := newAllocator(cfg.CIDR)
-	if err != nil {
-		return nil, err
+	// set default cidr
+	if cfg.CIDR == "" {
+		cfg.CIDR = defaultCIDR
 	}
+
+	// flatten structure
 	var targets []*target
 	for _, c := range cfg.Contexts {
 		for _, ns := range c.Namespaces {
 			for _, svc := range ns.Services {
-				addr, err := alloc.nextIP()
-				if err != nil {
-					return nil, err
-				}
 				targets = append(targets, &target{
 					context:   c.Name,
 					namespace: ns.Name,
 					service:   svc.Name,
-					addr:      addr,
 					ports:     map[string]string{},
 				})
 			}
 		}
 	}
-	return targets, nil
+	return cfg.CIDR, targets, nil
 }
 
-type allocator struct {
-	cur   net.IP
-	net   *net.IPNet
-	count int
-}
-
-func newAllocator(cidr string) (*allocator, error) {
-	ip, ipNet, err := net.ParseCIDR(cidr)
+// generate n ips in the given cidr
+func generateIPs(cidr string, n int) ([]string, error) {
+	cur, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, err
 	}
-	return &allocator{
-		cur:   ip,
-		net:   ipNet,
-		count: 0,
-	}, nil
+	var ips []string
+	for i := 0; i < n; i++ {
+		for i := len(cur) - 1; i >= 0; i-- {
+			cur[i]++
+			if cur[i] != 0 {
+				break
+			}
+		}
+		if !ipNet.Contains(cur) {
+			return nil, fmt.Errorf("CIDR overflow (%v allocated)", i)
+		}
+		ips = append(ips, cur.String())
+	}
+	return ips, nil
 }
 
-func (a *allocator) nextIP() (string, error) {
-	for i := len(a.cur) - 1; i >= 0; i-- {
-		a.cur[i]++
-		if a.cur[i] != 0 {
-			break
-		}
-	}
-	if !a.net.Contains(a.cur) {
-		return "", fmt.Errorf("CIDR overflow (%v allocated)", a.count)
-	}
-	a.count++
-	return a.cur.String(), nil
+// target represents a forwarded service (all ports)
+type target struct {
+	context   string // k8s context name
+	namespace string // k8s namespace name
+	service   string // k8s service name
+
+	addr     string            // assigned local ip
+	ports    map[string]string // detected ports (number->name,proto)
+	conflict bool              // cross-context name collision
+}
+
+// local is a unique id within a context
+func (t target) local() string {
+	return localID(t.namespace, t.service)
+}
+
+// global is a unique id across all contexts
+func (t target) global() string {
+	return globalID(t.context, t.namespace, t.service)
+}
+
+// unique id within a context
+func localID(namespace, service string) string {
+	return fmt.Sprintf("%s.%s", service, namespace)
+}
+
+// unique id across all contexts
+func globalID(context, namespace, service string) string {
+	return fmt.Sprintf("%s.%s.%s", service, namespace, context)
 }

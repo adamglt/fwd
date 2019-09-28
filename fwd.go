@@ -1,293 +1,243 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/csv"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/sirupsen/logrus"
 	"github.com/txn2/txeh"
 	"golang.org/x/sync/errgroup"
 )
 
-var (
-	log = &logrus.Logger{
-		Out:       os.Stdout,
-		Formatter: &logrus.TextFormatter{},
-		Hooks:     make(logrus.LevelHooks),
-		Level:     logrus.InfoLevel,
-	}
-)
-
-func main() {
-	if os.Geteuid() != 0 {
-		fmt.Println("fwd must run as root")
-		os.Exit(1)
-	}
-
-	targets, err := readConfig()
-	if err != nil {
-		log.Fatalf("failed to read config file: %v", err)
-	}
-
-	log.Info("filling contexts...")
-	if err := fillContexts(targets); err != nil {
-		log.Fatalf("failed to fill contexts: %v", err)
-	}
-
-	log.Info("checking for conflicts...")
-	if err := markConflicts(targets); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Info("filling service ports...")
-	if err := fillPorts(targets); err != nil {
-		log.Fatalf("failed to fill ports: %v", err)
-	}
-
-	log.Info("running global setup...")
-	if err := setup(targets); err != nil {
-		log.Fatalf("failed to setup local network: %v", err)
-	}
-
-	log.Info("writing hosts...")
-	hosts, err := txeh.NewHostsDefault()
-	if err != nil {
-		log.Fatalf("failed to init hosts: %v", err)
-	}
-	for _, t := range targets {
-		hosts.RemoveAddress(t.addr)
-		hosts.AddHost(t.addr, t.fqn())
-		if !t.conflict {
-			hosts.AddHost(t.addr, t.short())
-		}
-	}
-	if err := hosts.Save(); err != nil {
-		log.Fatalf("failed to update hosts file: %v", err)
-	}
-
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
-	go watchSig(cancel)
-
-	eg, ctx := errgroup.WithContext(ctx)
-	for _, t := range targets {
-		f := fwder{
-			ctx:    ctx,
-			target: t,
-		}
-		eg.Go(f.run)
-	}
-	if err := eg.Wait(); err != nil {
-		log.Warnf("error caught: %v", err)
-	}
-
-	log.Info("cleaning up hosts...")
-	for _, t := range targets {
-		hosts.RemoveAddress(t.addr)
-	}
-	if err := hosts.Save(); err != nil {
-		log.Fatalf("failed to update hosts file: %v", err)
-	}
-
-	log.Info("running global cleanup...")
-	if err := cleanup(targets); err != nil {
-		log.Fatalf("failed to cleanup local network: %v", err)
-	}
+type fwd struct {
+	log      logrus.FieldLogger
+	kubectl  kubectl
+	cidr     string
+	targets  []*target
+	contexts []string
 }
 
-func fillContexts(targets []*target) error {
-	// find current context
-	cmd := exec.Command("kubectl", "config", "current-context")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return errors.New(string(out))
+func (f *fwd) run(ctx context.Context) error {
+	f.log.Info("filling contexts...")
+	if err := f.fillContexts(); err != nil {
+		return fmt.Errorf("failed to fill target contexts: %w", err)
 	}
-	cur := string(out)
+	if err := f.checkConflicts(); err != nil {
+		return fmt.Errorf("unresolveable conflicts: %w", err)
+	}
 
-	// fill missing entries
-	for _, t := range targets {
-		if t.context == "" {
-			t.context = cur
+	f.log.Info("filling service ports...")
+	if err := f.fillPorts(); err != nil {
+		return fmt.Errorf("failed to fill ports: %w", err)
+	}
+
+	ips, err := generateIPs(f.cidr, len(f.targets))
+	if err != nil {
+		return fmt.Errorf("failed to generate ips: %w", err)
+	}
+
+	f.log.Info("preparing local network...")
+	if err := prepareIPs(ips); err != nil {
+		return fmt.Errorf("failed to prepare local network: %w", err)
+	}
+	defer func() {
+		f.log.Info("cleaning up local network...")
+		if err := cleanupIPs(ips); err != nil {
+			f.log.Warnf("failed to cleanup local network: %v", err)
 		}
+	}()
+
+	f.log.Info("writing local hosts...")
+	hosts, err := txeh.NewHostsDefault()
+	if err != nil {
+		return fmt.Errorf("failed to init hosts: %w", err)
+	}
+	for i := 0; i < len(f.targets); i++ {
+		t := f.targets[i]
+		t.addr = ips[i]                   // set addr (ips have same length)
+		hosts.RemoveAddress(t.addr)       // remove old entries
+		hosts.AddHost(t.addr, t.global()) // add global fwd
+		if !t.conflict {
+			hosts.AddHost(t.addr, t.local()) // add local when unique
+		}
+	}
+	if err := hosts.Save(); err != nil {
+		return fmt.Errorf("failed to write hosts file: %v", err)
+	}
+	defer func() {
+		f.log.Info("cleaning up hosts...")
+		for _, ip := range ips {
+			hosts.RemoveAddress(ip)
+		}
+		if err := hosts.Save(); err != nil {
+			f.log.Warnf("failed to cleanup hosts: %v", err)
+		}
+	}()
+
+	eg, ctx := errgroup.WithContext(ctx)
+	for _, t := range f.targets {
+		eg.Go(f.child(ctx, t))
+	}
+	if err := eg.Wait(); err != nil {
+		return fmt.Errorf("error caught: %w", err)
 	}
 
 	return nil
 }
 
-func markConflicts(targets []*target) error {
-	shorts := make(map[string]*target, len(targets))
-	dups := make(map[string]bool)
-	for _, t := range targets {
-		short := t.short()
-		if other, ok := shorts[short]; ok {
+// fills empty contexts and validates all contexts referenced in the config
+func (f *fwd) fillContexts() error {
+	available, cur, err := f.kubectl.contexts()
+	if err != nil {
+		return fmt.Errorf("failed to retrieve kubectl contexts: %w", err)
+	}
+
+	used := make(map[string]bool, len(available))
+	for _, kctx := range available {
+		used[kctx] = false // insert as unused
+	}
+
+	for _, t := range f.targets {
+		// try defaulting
+		if t.context == "" {
+			if cur == "" {
+				return errors.New("config contains empty context but no default is available")
+			}
+			t.context = cur
+		}
+		// check available
+		if _, ok := used[t.context]; !ok {
+			return fmt.Errorf("unknown config context: %s", t.context)
+		}
+		// set as used
+		used[t.context] = true
+	}
+
+	// collect contexts referenced by the config
+	for name, used := range used {
+		if used {
+			f.contexts = append(f.contexts, name)
+		}
+	}
+	return nil
+}
+
+// marks conflicting local service id (svc.ns),
+// so only their global forms (svc.ns.context) get forwarded.
+// if global ids are conflicting, an error is returned.
+func (f *fwd) checkConflicts() error {
+	var (
+		locals = make(map[string]*target, len(f.targets)) // local->target
+		dups   = make(map[string]bool)                    // dup globals
+	)
+	for _, t := range f.targets {
+		local := t.local()
+		if other, ok := locals[local]; ok {
+			// local conflict (ok)
 			t.conflict = true
 			other.conflict = true
 			if t.context == other.context {
+				// global conflict (not ok)
 				dups[t.context] = true
 			}
 		} else {
-			shorts[short] = t
+			// no conflict (yet)
+			locals[local] = t
 		}
 	}
+
+	// collect global dups and return an error
 	if len(dups) > 0 {
-		var col []string
+		sb := &strings.Builder{}
 		for d := range dups {
-			col = append(col, d)
+			if sb.Len() > 0 {
+				sb.WriteString("; ")
+			}
+			sb.WriteString(d)
 		}
-		return fmt.Errorf("duplicate service entries: %s", strings.Join(col, ", "))
+		return fmt.Errorf("duplicate service entries: %s", sb.String())
 	}
+
 	return nil
 }
 
-// output: <svc>.<ns>,<protocol>,<portName>,<portNumber>
-const tmpl = `{{range $i, $svc := .items}}{{range .spec.ports}}` +
-	`{{$svc.metadata.name}}.{{$svc.metadata.namespace}},{{.protocol}},{{.name}},{{.port}}` +
-	`{{println}}{{end}}{{end}}`
-
-func fillPorts(targets []*target) error {
-	var (
-		contexts  []string                                 // unique contexts
-		contextsM = make(map[string]bool)                  // dedup contexts
-		targetsM  = make(map[string]*target, len(targets)) // targets by fqn
-	)
-	for _, t := range targets {
-		if !contextsM[t.context] {
-			contextsM[t.context] = true
-			contexts = append(contexts, t.context)
-		}
-		targetsM[t.fqn()] = t
+// fills target ports by querying for all remote service ports.
+// if a service cannot be
+func (f *fwd) fillPorts() error {
+	// context->local->target.
+	// separated for concurrent safety.
+	lookup := make(map[string]map[string]*target)
+	for _, kctx := range f.contexts {
+		lookup[kctx] = make(map[string]*target)
+	}
+	for _, t := range f.targets {
+		lookup[t.context][t.local()] = t
 	}
 
-	eg := errgroup.Group{}
-	for _, c := range contexts {
-		localC := c
-		eg.Go(func() error {
-			cmd := exec.Command("kubectl", "get", "services",
-				"--context", localC,
-				"--all-namespaces",
-				"-o=go-template="+tmpl,
-			)
-			out, err := cmd.Output()
+	// func per context to populate ports
+	do := func(kctx string) func() error {
+		return func() error {
+			ports, err := f.kubectl.ports(kctx)
 			if err != nil {
-				return fmt.Errorf("failed to run cmd: %w", err)
+				return err
 			}
-			records, err := csv.NewReader(bytes.NewReader(out)).ReadAll()
-			if err != nil {
-				return fmt.Errorf("failed to parse csv: %w", err)
-			}
-			for _, record := range records {
-				var (
-					shortKey = record[0]
-					proto    = record[1]
-					name     = record[2]
-					number   = record[3]
-				)
-				if proto != "TCP" {
-					continue
-				}
-				if name == "<no value>" {
-					name = "unnamed"
-				}
-				longKey := fmt.Sprintf("%s.%s", shortKey, localC)
-				if t, ok := targetsM[longKey]; ok {
-					t.ports[name] = number
+			locals := lookup[kctx]
+			for _, p := range ports {
+				local := localID(p.namespace, p.service)
+				if t, ok := locals[local]; ok {
+					// number -> name,proto
+					t.ports[p.number] = fmt.Sprintf("%s,%s", p.name, p.proto)
 				}
 			}
-
 			return nil
-		})
+		}
+	}
+
+	// run per context
+	eg := errgroup.Group{}
+	for _, kctx := range f.contexts {
+		eg.Go(do(kctx))
 	}
 	if err := eg.Wait(); err != nil {
 		return err
 	}
 
+	// collect unfilled targets
 	var missing []string
-	for _, t := range targets {
+	for _, t := range f.targets {
 		if len(t.ports) == 0 {
-			missing = append(missing, t.fqn())
+			missing = append(missing, t.global())
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("could not find service ports: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("missing services: %s", strings.Join(missing, "; "))
 	}
 
 	return nil
 }
 
-func watchSig(cancel context.CancelFunc) {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-ch
-	fmt.Printf("caught [%s], exiting...\n", sig)
-	cancel()
-}
-
-type fwder struct {
-	ctx    context.Context
-	target *target
-}
-
-func (f fwder) run() error {
-	for {
-		cmd := exec.Command("kubectl", "port-forward",
-			fmt.Sprintf("svc/%s", f.target.service),
-			"--context", f.target.context,
-			"--address", f.target.addr,
-			"--namespace", f.target.namespace,
-		)
-		for name, number := range f.target.ports {
-			log.Infof("forwarding %s:%s (%s)", f.target.fqn(), number, name)
-			if !f.target.conflict {
-				log.Infof("forwarding %s:%s (%s)", f.target.short(), number, name)
+// spawns an always-on kubectl port-forward that auto-retries until ctx.done
+func (f *fwd) child(ctx context.Context, t *target) func() error {
+	return func() error {
+		ports := make([]string, 0, len(t.ports))
+		for num, txt := range t.ports {
+			f.log.Infof("forwarding %s:%s (%s)", t.global(), num, txt)
+			if !t.conflict {
+				f.log.Infof("forwarding %s:%s (%s)", t.local(), num, txt)
 			}
-			cmd.Args = append(cmd.Args, number)
+			ports = append(ports, num)
 		}
-		stderr, err := cmd.StderrPipe()
-		if err != nil {
-			return fmt.Errorf("pipe failed: %v", err)
-		}
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("start failed: %v", err)
-		}
-
-		reset := make(chan struct{})
-		exit := false
-		go func() {
-			select {
-			case <-f.ctx.Done():
-				// external signal
-				exit = true
-			case <-reset:
-				// reset
+		for {
+			err := f.kubectl.forward(ctx, t.context, t.namespace, t.service, ports, t.addr)
+			if err != nil {
+				if errors.Is(err, errDone) {
+					return nil
+				}
+				return err
 			}
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		}()
-
-		s := bufio.NewScanner(stderr)
-		for s.Scan() {
-			log.Warnf("error detected in %s, reconnecting...", f.target.fqn())
-			close(reset)
-		}
-		if err := s.Err(); err != nil {
-			log.Warnf("scanner failed: %v", err)
-		}
-
-		_ = cmd.Wait()
-		if exit {
-			break
+			f.log.Warnf("transient error detected in %s, reconnecting...", t.global())
 		}
 	}
-
-	return nil
 }
