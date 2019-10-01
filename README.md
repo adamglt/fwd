@@ -2,6 +2,7 @@
 
 `kubectl port-forward` with multiple targets and auto-recovery. 
 
+[![Build Status](https://travis-ci.org/adamglt/fwd.svg?branch=master)](https://travis-ci.org/fmovlex/desprite) [![GoDoc](https://godoc.org/github.com/fmovlex/desprite?status.svg)](https://godoc.org/github.com/fmovlex/desprite)
 
 ## `Usage`
 
