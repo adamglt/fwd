@@ -1,0 +1,17 @@
+language: go
+go:
+- 1.13.x
+script:
+- GOOS=darwin  GOARCH=amd64 go build -o bin/fwd-osx-amd64
+- GOOS=linux   GOARCH=amd64 go build -o bin/fwd-linux-amd64
+deploy:
+  provider: releases
+  skip_cleanup: true
+  api_key:
+    secure: sNPiKoWkGBmW6YSt2tzL7czFedQ4cMxnqsRRGLVJWw1OgyZDvWVfJtcQs5HGl3QhBzHCYDgyOyc5bj9iP9E/mZPKEkh/stUs6ky4r0OZXzPhXjHH19+eLSHjWLeYJlCKFuPyBOuk3wFdXkzBfURZjGVSTcFZYp2u2LmEqU7+gb9wDQje+WKCzVuKLoEc6k1QaxrKkxOXvR9EoQKDccB7VmM4dqNNkcTlhGZhpFyUTS/PTdVzqqHmDIIYtCARcgYxoTiQPC2UFUU30S896ymtjN7gRlNiA6ogTDvTcNkR34jY5y/iZ8XIvZxWptigtHodfmG3+nqswoTd0dBougo2EV2vGB3dJ91ENtvA/clHEJD6IdsyOMNRR7pMRQOxLiOb8cgXgbIufhlNNyaZbWBzGssFsxXl7gIa8Y/33L4F8GQcKUL+yfyN0zunA1xRwIwQYS/JLZT4bZru8St6wRlklyn6QhJkKa3SiXboeHOsNdZwZj5GVeR5yY2PEDno4bIF1NNKkWfPlhlsYNaMYUM6oN7I2W1gPzhsBZBPUK36MugdeDPFeBw3IsrMwx4hy9lE4hcPPahb3nfTKu6rne3lvM7DYfE0vqFNn7LNO+N9TUbU7ZW8FFts0PokOEoTEK3Z66EblD9OPHGOkbOCHkBqhyo5daIRZwW+7IklxDUo2Sw=
+  file:
+  - bin/fwd-osx-amd64
+  - bin/fwd-linux-amd64
+  on:
+    repo: adamglt/fwd
+    tags: true
