@@ -8,9 +8,16 @@ import (
 	"syscall"
 
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 )
 
 func main() {
+	// parse flags
+	var (
+		configPath = pflag.StringP("config-path", "c", "$HOME/.fwd.yaml", "path to config file")
+	)
+	pflag.Parse()
+
 	if os.Geteuid() != 0 {
 		fmt.Println("fwd must run as root")
 		os.Exit(1)
@@ -23,7 +30,7 @@ func main() {
 		Level:     logrus.InfoLevel,
 	}
 
-	cidr, targets, err := readConfig()
+	cidr, targets, err := readConfig(log, *configPath)
 	if err != nil {
 		log.Fatalf("failed to read config file: %v", err)
 	}

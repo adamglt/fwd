@@ -7,9 +7,9 @@
 ## `Usage`
 
 `go get -u github.com/adamglt/fwd` or download a binary from the releases tab.
-
-`fwd` looks for a local `.fwd.yaml`, then for `$HOME/.fwd.yaml`.  
-Here's an example of a multi-context multi-namespace forwarding config.
+  
+Here's an example of a multi-context multi-namespace forwarding config.  
+`fwd` uses `$HOME/.fwd.yaml` by default, you can supply a different file using `fwd -c <path>`.
 
 ```yaml
 cidr: 127.0.15.1/24 # local cidr - defaults to 127.0.11.0/24

@@ -5,8 +5,8 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"path/filepath"
 
+	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
 
@@ -38,17 +38,10 @@ type config struct {
 
 // reads the config file and flattens the tree structure.
 // local directory is tried first, then the user's home directory.
-func readConfig() (string, []*target, error) {
-	// try local dir
-	raw, err := ioutil.ReadFile(configFile)
-	if err != nil && os.IsNotExist(err) {
-		home, homeErr := os.UserHomeDir()
-		if homeErr != nil {
-			return "", nil, homeErr
-		}
-		// try home dir
-		raw, err = ioutil.ReadFile(filepath.Join(home, configFile))
-	}
+func readConfig(log *logrus.Logger, configPath string) (string, []*target, error) {
+	expanded := os.ExpandEnv(configPath)
+	log.Infof("using config at: %s", expanded)
+	raw, err := ioutil.ReadFile(expanded)
 	if err != nil {
 		return "", nil, err
 	}
