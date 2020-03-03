@@ -29,8 +29,12 @@ func (f *fwd) run(ctx context.Context) error {
 	}
 
 	f.log.Info("filling service ports...")
-	if err := f.fillPorts(); err != nil {
+	if missing, err := f.fillPorts(); err != nil {
 		return fmt.Errorf("failed to fill ports: %w", err)
+	} else if missing != nil {
+		for _,m := range missing {
+			f.log.Warnf("service not found: %s", m)
+		}
 	}
 
 	ips, err := generateIPs(f.cidr, len(f.targets))
@@ -165,7 +169,7 @@ func (f *fwd) checkConflicts() error {
 
 // fills target ports by querying for all remote service ports.
 // if a service cannot be
-func (f *fwd) fillPorts() error {
+func (f *fwd) fillPorts() ([]string, error) {
 	// context->local->target.
 	// separated for concurrent safety.
 	lookup := make(map[string]map[string]*target)
@@ -201,21 +205,28 @@ func (f *fwd) fillPorts() error {
 		eg.Go(do(kctx))
 	}
 	if err := eg.Wait(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// collect unfilled targets
 	var missing []string
+	var found []*target
 	for _, t := range f.targets {
 		if len(t.ports) == 0 {
 			missing = append(missing, t.global())
+		} else {
+			found = append(found, t)
 		}
 	}
+
+	// continue with existing targets only
+	f.targets = found
+
 	if len(missing) > 0 {
-		return fmt.Errorf("missing services: %s", strings.Join(missing, "; "))
+		return missing, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
 // spawns an always-on kubectl port-forward that auto-retries until ctx.done
