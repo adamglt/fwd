@@ -32,7 +32,7 @@ func (f *fwd) run(ctx context.Context) error {
 	if missing, err := f.fillPorts(); err != nil {
 		return fmt.Errorf("failed to fill ports: %w", err)
 	} else if missing != nil {
-		for _,m := range missing {
+		for _, m := range missing {
 			f.log.Warnf("service not found: %s", m)
 		}
 	}
@@ -65,6 +65,9 @@ func (f *fwd) run(ctx context.Context) error {
 		hosts.AddHost(t.addr, t.global()) // add global fwd
 		if !t.conflict {
 			hosts.AddHost(t.addr, t.local()) // add local when unique
+		}
+		for _, alias := range t.aliases {
+			hosts.AddHost(t.addr, alias) // add aliases (globally unique)
 		}
 	}
 	if err := hosts.Save(); err != nil {
@@ -133,8 +136,9 @@ func (f *fwd) fillContexts() error {
 // if global ids are conflicting, an error is returned.
 func (f *fwd) checkConflicts() error {
 	var (
-		locals = make(map[string]*target, len(f.targets)) // local->target
-		dups   = make(map[string]bool)                    // dup globals
+		locals  = make(map[string]*target, len(f.targets)) // local->target
+		aliases = make(map[string]bool)                    // aliases (global)
+		dups    = make(map[string]bool)                    // dup globals
 	)
 	for _, t := range f.targets {
 		local := t.local()
@@ -149,6 +153,14 @@ func (f *fwd) checkConflicts() error {
 		} else {
 			// no conflict (yet)
 			locals[local] = t
+		}
+		for _, a := range t.aliases {
+			if aliases[a] {
+				// alias conflict (not ok)
+				dups[a] = true
+			} else {
+				aliases[a] = true
+			}
 		}
 	}
 
@@ -237,6 +249,9 @@ func (f *fwd) child(ctx context.Context, t *target) func() error {
 			f.log.Infof("forwarding %s:%s (%s)", t.global(), num, txt)
 			if !t.conflict {
 				f.log.Infof("forwarding %s:%s (%s)", t.local(), num, txt)
+			}
+			for _, alias := range t.aliases {
+				f.log.Infof("forwarding %s:%s (%s)", alias, num, txt)
 			}
 			ports = append(ports, num)
 		}

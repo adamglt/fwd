@@ -11,9 +11,6 @@ import (
 )
 
 const (
-	// file name fwd looks for
-	configFile = ".fwd.yaml"
-
 	// default local cidr
 	defaultCIDR = "127.0.11.0/24"
 )
@@ -30,7 +27,8 @@ type config struct {
 		Namespaces []struct {
 			Name     string `yaml:"name"`
 			Services []struct {
-				Name string `yaml:"name"`
+				Name    string   `yaml:"name"`
+				Aliases []string `yaml:"aliases"`
 			} `yaml:"services"`
 		} `yaml:"namespaces"`
 	} `yaml:"contexts"`
@@ -66,6 +64,7 @@ func readConfig(log *logrus.Logger, configPath string) (string, []*target, error
 					context:   c.Name,
 					namespace: ns.Name,
 					service:   svc.Name,
+					aliases:   svc.Aliases,
 					ports:     map[string]string{},
 				})
 			}
@@ -98,9 +97,10 @@ func generateIPs(cidr string, n int) ([]string, error) {
 
 // target represents a forwarded service (all ports)
 type target struct {
-	context   string // k8s context name
-	namespace string // k8s namespace name
-	service   string // k8s service name
+	context   string   // k8s context name
+	namespace string   // k8s namespace name
+	service   string   // k8s service name
+	aliases   []string // additional global names to expose the service under
 
 	addr     string            // assigned local ip
 	ports    map[string]string // detected ports (number->name,proto)
