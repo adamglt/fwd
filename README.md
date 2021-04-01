@@ -30,12 +30,16 @@ contexts:
     services:
     - name: svc1
     - name: svc2
+      aliases:
+      - short1
+      - short2
 
 ``` 
 
 `fwd` proxies calls to `kubectl port-forward svc/<...>` for every port the service exposes.  
 The endpoints are then made available using their local names (`<svc>.<namespace>:<port>`) and global names (`<svc>.<namespace>.<context>:<port>`).  
-When the local name exists in more than one context, only the global name is made available.
+When the local name exists in more than one context, only the global name is made available.  
+Service entries may also include short global aliases to make access easier - in the example above, `svc2.ns2:<port>` will also be exposed at `short1:<port>` and `short2:<port>`.
 
 `fwd` is very similar to the popular https://github.com/txn2/kubefwd in concept, with three major differences:
 - it is config-based and not flag-based
